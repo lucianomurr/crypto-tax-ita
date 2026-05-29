@@ -1,0 +1,15 @@
+# Dati personali e sensibili
+.env
+data/
+output/
+
+# Cache Python
+__pycache__/
+*.py[cod]
+
+# File Excel temporanei
+*.xlsx
+~$*
+
+# macOS
+.DS_Store
