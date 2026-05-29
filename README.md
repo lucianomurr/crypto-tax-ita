@@ -1,9 +1,31 @@
 # Crypto Tax IT
 
+![CI](https://github.com/{username}/{repo}/actions/workflows/ci.yml/badge.svg)
+![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
+![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-green.svg)
+![Streamlit](https://img.shields.io/badge/Streamlit-1.35%2B-red.svg)
+![Tests](https://img.shields.io/badge/tests-70%20passed-brightgreen.svg)
+
 Dashboard per la dichiarazione fiscale italiana delle cripto-attività.  
 Calcola automaticamente i dati per i **Quadri RT e RW** (o Riquadri T e W del 730) partendo dal CSV esportato da Coinbase.
 
-> ⚠️ Strumento puramente informativo. Verifica sempre i risultati con un commercialista o consulente tributario abilitato prima di presentare la dichiarazione.
+---
+
+## ⚠️ Disclaimer
+
+**Questo strumento è fornito esclusivamente a scopo informativo ed educativo.**
+
+- Non costituisce consulenza fiscale, legale o finanziaria di alcun tipo
+- I calcoli prodotti potrebbero essere incompleti, imprecisi o non applicabili alla tua situazione specifica
+- Le normative fiscali sulle cripto-attività sono soggette a frequenti aggiornamenti
+- I risultati non sostituiscono in alcun modo il parere di un commercialista o consulente tributario abilitato
+
+**Prima di presentare qualsiasi dichiarazione fiscale è obbligatorio:**
+1. Verificare in modo indipendente tutti i dati e i calcoli
+2. Consultare un professionista fiscale qualificato (commercialista)
+3. Incrociare i risultati con le fonti ufficiali dell'Agenzia delle Entrate
+
+Gli autori e i contributori di questo software non si assumono alcuna responsabilità per perdite, sanzioni, multe o danni derivanti dall'uso o dall'affidamento a questo software o ai suoi output.
 
 ---
 
@@ -155,6 +177,29 @@ I report vengono salvati in `output/report_RW_2025.csv` e `output/report_RT_2025
 
 ---
 
+## Sviluppo & Test
+
+```bash
+# Installa dipendenze di sviluppo
+pip install -r requirements-dev.txt
+
+# Esegui tutti i test (70 test)
+pytest tests/ -v
+
+# Test con copertura del codice
+pytest tests/ --cov=modules --cov=config --cov-report=term-missing
+
+# Verifica sintassi
+python -m py_compile app.py modules/*.py
+
+# Svuota cache CoinGecko (se i prezzi sembrano sbagliati)
+rm data/price_cache.json
+```
+
+La CI esegue i test automaticamente su Python 3.10, 3.11 e 3.12 ad ogni push. Vedi `.github/workflows/ci.yml`.
+
+---
+
 ## Note fiscali importanti
 
 ### Metodo LIFO
@@ -194,3 +239,11 @@ I wallet personali (Ledger, MetaMask, ecc.) richiedono un **rigo RW separato** p
 - Legge n. 197/2022 (Legge di Bilancio 2023) — introduzione regime fiscale cripto
 - Legge n. 207/2024 (Legge di Bilancio 2025) — abolizione franchigia, conferma aliquota 26%
 - Circolare ADE n. 30/E del 2023 — chiarimenti operativi
+
+---
+
+## Licenza
+
+Distribuito sotto licenza **MIT**. Vedi il file [LICENSE](LICENSE) per i dettagli completi.
+
+Il testo della licenza include un'avvertenza esplicita sull'uso del software in ambito fiscale: i risultati prodotti non costituiscono consulenza professionale e l'utilizzo è a proprio rischio.
