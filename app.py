@@ -16,7 +16,11 @@ load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 from config import EXCHANGE_RATES_CACHE, TAX_YEAR, get_tax_params
 from modules.csv_loader import load_coinbase_csv_from_buffer
 from modules.exchange_rates import get_ecb_rates, refresh_ecb_rates
-from modules.price_fetcher import fetch_prices_for_rw, set_api_key, TICKER_TO_ID
+from modules.price_fetcher import (
+    fetch_prices_for_rw, fetch_missing_prices,
+    get_cached_prices_for_year, check_prices_completeness,
+    set_api_key, TICKER_TO_ID,
+)
 from modules.csv_merger import (
     save_upload, remove_upload, list_uploads, load_all_uploads,
     load_from_buffer, uploads_fingerprint, file_summary, check_history,
@@ -119,18 +123,28 @@ with st.sidebar:
     set_api_key(cg_key or None)
     if _env_key:
         st.caption("🔑 Key caricata da `.env`")
+
     price_cache_key = f"market_prices_{selected_year}"
-    prices_loaded = price_cache_key in st.session_state
-    if prices_loaded:
+    fetch_prices_btn = False  # default; verrà impostato sotto se necessario
+
+    if price_cache_key in st.session_state:
         mp = st.session_state[price_cache_key]
-        n_with_prices = sum(1 for v in mp.values() if v.get("end") is not None)
-        st.success(f"{n_with_prices} asset con prezzo reale")
+        n_ok = sum(1 for v in mp.values() if v.get("end") is not None)
+        n_tot = len(mp)
+        if n_ok == n_tot and n_tot > 0:
+            st.success(f"✅ {n_ok}/{n_tot} prezzi in cache")
+        else:
+            st.warning(f"⚠️ {n_ok}/{n_tot} prezzi in cache — alcuni mancanti")
+            fetch_prices_btn = st.button(
+                "Aggiorna prezzi mancanti", use_container_width=True,
+                help="Scarica solo i prezzi non ancora in cache"
+            )
     else:
-        st.info("Prezzi al 01/01 e 31/12 non ancora scaricati")
-    fetch_prices_btn = st.button(
-        "Scarica prezzi storici", use_container_width=True,
-        help=f"Recupera prezzi al 01/01/{selected_year} e 31/12/{selected_year} da CoinGecko"
-    )
+        st.info("Prezzi non ancora caricati per questo anno")
+        fetch_prices_btn = st.button(
+            "Scarica prezzi storici", use_container_width=True,
+            help=f"Recupera prezzi al 01/01/{selected_year} e 31/12/{selected_year} da CoinGecko"
+        )
 
     st.divider()
     st.subheader("Tassi BCE EUR/USD")
@@ -171,22 +185,75 @@ if "rates" not in st.session_state and os.path.exists(EXCHANGE_RATES_CACHE):
 
 rates = st.session_state.get("rates", {})
 
-# ── Fetch prezzi CoinGecko ────────────────────────────────────────────────────
-if fetch_prices_btn and "df" in st.session_state:
-    tickers = [
+# ── Auto-caricamento prezzi da cache JSON ─────────────────────────────────────
+# Eseguito ogni volta che cambia l'anno o al primo avvio — senza rete
+if "df" in st.session_state and price_cache_key not in st.session_state:
+    _tickers = [
         t for t in st.session_state["df"]["asset"].unique()
         if t != "EUR" and t in TICKER_TO_ID
     ]
-    progress_bar = st.sidebar.progress(0, text="Scaricamento prezzi...")
+    _cached = get_cached_prices_for_year(_tickers, selected_year)
+    if any(v["end"] is not None for v in _cached.values()):
+        st.session_state[price_cache_key] = _cached
 
-    def _progress(ticker, i, total):
-        progress_bar.progress((i + 1) / total, text=f"CoinGecko: {ticker} ({i+1}/{total})")
+# ── Dialog prezzi mancanti ────────────────────────────────────────────────────
+@st.dialog(f"Prezzi storici {selected_year}", width="large")
+def _dialog_prezzi_mancanti(completeness: dict) -> None:
+    ms = completeness["missing_start"]
+    me = completeness["missing_end"]
+    nm = completeness["not_mapped"]
 
-    fetched = fetch_prices_for_rw(tickers, selected_year, progress_callback=_progress)
-    st.session_state[price_cache_key] = fetched
-    progress_bar.empty()
-    st.sidebar.success(f"Prezzi scaricati per {len(fetched)} asset")
-    st.rerun()
+    st.markdown(
+        f"Per l'anno **{selected_year}** alcuni prezzi non sono ancora in cache locale."
+    )
+
+    if me:
+        st.warning(f"**Prezzo al 31/12/{selected_year} mancante** per: `{'`, `'.join(me)}`")
+    if ms:
+        st.warning(f"**Prezzo al 01/01/{selected_year} mancante** per: `{'`, `'.join(ms)}`")
+    if nm:
+        st.info(
+            f"Asset non mappati su CoinGecko (ignorati): `{'`, `'.join(nm)}`  \n"
+            "Puoi aggiungere il mapping in `modules/price_fetcher.TICKER_TO_ID`."
+        )
+
+    st.markdown("Vuoi scaricare ora i prezzi mancanti da CoinGecko?")
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("✅ Sì, scarica ora", type="primary", use_container_width=True):
+            progress = st.progress(0, text="Scaricamento...")
+
+            def _prog(ticker, i, total):
+                progress.progress((i + 1) / total, text=f"{ticker} ({i+1}/{total})")
+
+            fetched = fetch_missing_prices(ms, me, selected_year, progress_callback=_prog)
+            # Unisce con i prezzi già in cache in session_state
+            existing = st.session_state.get(price_cache_key, {})
+            existing.update(fetched)
+            st.session_state[price_cache_key] = existing
+            progress.empty()
+            st.rerun()
+    with col2:
+        if st.button("✖ Annulla", use_container_width=True):
+            st.rerun()
+
+
+# ── Fetch CoinGecko (pulsante sidebar) ───────────────────────────────────────
+if fetch_prices_btn and "df" in st.session_state:
+    _tickers_all = [
+        t for t in st.session_state["df"]["asset"].unique()
+        if t != "EUR" and t in TICKER_TO_ID
+    ]
+    _completeness = check_prices_completeness(_tickers_all, selected_year)
+
+    if _completeness["complete"]:
+        # Tutto già in cache, carica solo dalla cache
+        st.session_state[price_cache_key] = _completeness["cached"]
+        st.sidebar.success("Tutti i prezzi già in cache!")
+        st.rerun()
+    else:
+        # Apre il dialog per i prezzi mancanti
+        _dialog_prezzi_mancanti(_completeness)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # CARICAMENTO DATI (da data/uploads/ con cache in session_state)

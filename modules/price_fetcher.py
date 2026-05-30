@@ -137,26 +137,112 @@ def get_price_eur(ticker: str, target_date: date, cache: dict | None = None) -> 
     return None
 
 
+def get_cached_prices_for_year(
+    tickers: list[str], tax_year: int
+) -> dict[str, dict[str, float | None]]:
+    """
+    Legge SOLO dalla cache locale (nessuna chiamata di rete).
+    Ritorna {ticker: {"start": prezzo_o_None, "end": prezzo_o_None}}.
+    None indica che il prezzo non è in cache per quella data.
+    """
+    start_date = date(tax_year, 1, 1)
+    end_date   = date(tax_year, 12, 31)
+    cache      = _load_cache()
+    results: dict[str, dict[str, float | None]] = {}
+
+    for ticker in tickers:
+        if ticker.upper() not in TICKER_TO_ID:
+            continue
+        start_price = _read_from_cache(ticker.upper(), start_date, cache)
+        end_price   = _read_from_cache(ticker.upper(), end_date,   cache)
+        results[ticker] = {"start": start_price, "end": end_price}
+
+    return results
+
+
+def check_prices_completeness(
+    tickers: list[str], tax_year: int
+) -> dict:
+    """
+    Controlla la completezza dei prezzi in cache per l'anno richiesto.
+    Ritorna un dict con:
+      - complete:      bool — tutti i prezzi presenti
+      - missing_start: list[str] — ticker senza prezzo al 01/01
+      - missing_end:   list[str] — ticker senza prezzo al 31/12
+      - not_mapped:    list[str] — ticker non presenti in TICKER_TO_ID
+      - cached:        dict      — i prezzi già in cache
+    """
+    cached     = get_cached_prices_for_year(tickers, tax_year)
+    not_mapped = [t for t in tickers if t.upper() not in TICKER_TO_ID]
+    missing_start = [t for t, v in cached.items() if v["start"] is None]
+    missing_end   = [t for t, v in cached.items() if v["end"]   is None]
+
+    return {
+        "complete":      not missing_start and not missing_end,
+        "missing_start": missing_start,
+        "missing_end":   missing_end,
+        "not_mapped":    not_mapped,
+        "cached":        cached,
+    }
+
+
+def _read_from_cache(ticker: str, target_date: date, cache: dict) -> float | None:
+    """Cerca il prezzo in cache risalendo fino a 5 giorni indietro (no rete)."""
+    for days_back in range(6):
+        key = _cache_key(ticker, target_date - timedelta(days=days_back))
+        if key in cache:
+            return cache[key]
+    return None
+
+
 def fetch_prices_for_rw(tickers: list[str], tax_year: int,
                         progress_callback=None) -> dict[str, dict[str, float | None]]:
     """
     Recupera prezzi al 01/01 e 31/12 per tutti i ticker.
+    Usa la cache locale se disponibile, altrimenti chiama CoinGecko.
     Ritorna {ticker: {"start": prezzo_01gen, "end": prezzo_31dic}}.
     progress_callback(ticker, current, total) — opzionale per la UI.
     """
     start_date = date(tax_year, 1, 1)
     end_date   = date(tax_year, 12, 31)
-
-    cache = _load_cache()
+    cache      = _load_cache()
     results: dict[str, dict[str, float | None]] = {}
 
     for i, ticker in enumerate(tickers):
         if progress_callback:
             progress_callback(ticker, i, len(tickers))
-
         results[ticker] = {
             "start": get_price_eur(ticker, start_date, cache),
             "end":   get_price_eur(ticker, end_date, cache),
         }
+
+    return results
+
+
+def fetch_missing_prices(
+    missing_start: list[str], missing_end: list[str], tax_year: int,
+    progress_callback=None
+) -> dict[str, dict[str, float | None]]:
+    """
+    Scarica da CoinGecko SOLO i prezzi mancanti dalla cache.
+    Più veloce di fetch_prices_for_rw quando la maggior parte è già in cache.
+    """
+    start_date = date(tax_year, 1, 1)
+    end_date   = date(tax_year, 12, 31)
+    cache      = _load_cache()
+
+    to_fetch = list(set(missing_start) | set(missing_end))
+    results: dict[str, dict[str, float | None]] = {}
+
+    for i, ticker in enumerate(to_fetch):
+        if progress_callback:
+            progress_callback(ticker, i, len(to_fetch))
+        start = (get_price_eur(ticker, start_date, cache)
+                 if ticker in missing_start else
+                 _read_from_cache(ticker.upper(), start_date, cache))
+        end   = (get_price_eur(ticker, end_date, cache)
+                 if ticker in missing_end else
+                 _read_from_cache(ticker.upper(), end_date, cache))
+        results[ticker] = {"start": start, "end": end}
 
     return results
