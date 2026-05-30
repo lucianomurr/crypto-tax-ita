@@ -17,6 +17,10 @@ from config import EXCHANGE_RATES_CACHE, TAX_YEAR, get_tax_params
 from modules.csv_loader import load_coinbase_csv_from_buffer
 from modules.exchange_rates import get_ecb_rates, refresh_ecb_rates
 from modules.price_fetcher import fetch_prices_for_rw, set_api_key, TICKER_TO_ID
+from modules.csv_merger import (
+    save_upload, remove_upload, list_uploads, load_all_uploads,
+    load_from_buffer, uploads_fingerprint, file_summary, check_history,
+)
 from modules.rw_report import compute_rw_data
 from modules.rt_report import compute_rt_data
 from modules.excel_report import generate_rw_excel
@@ -42,19 +46,50 @@ st.markdown(
 # ──────────────────────────────────────────────────────────────────────────────
 # SIDEBAR
 # ──────────────────────────────────────────────────────────────────────────────
+os.makedirs("data/uploads", exist_ok=True)
+os.makedirs("data", exist_ok=True)
+os.makedirs("output", exist_ok=True)
+
 with st.sidebar:
     st.title("🪙 Crypto Tax IT")
     st.divider()
 
-    uploaded_file = st.file_uploader(
-        "📂 Carica CSV Coinbase",
+    # ── Gestione CSV ─────────────────────────────────────────────────────────
+    st.subheader("📂 File CSV Coinbase")
+
+    uploads = list_uploads()
+    if uploads:
+        for u in uploads:
+            col_name, col_del = st.columns([4, 1])
+            with col_name:
+                st.caption(f"📄 {u['filename']}  \n`{u['size_kb']} KB`")
+            with col_del:
+                if st.button("✕", key=f"del_{u['filename']}", help=f"Rimuovi {u['filename']}"):
+                    remove_upload(u["filename"])
+                    # Forza ricarica
+                    for k in ["df", "uploaded_fingerprint", "available_years"]:
+                        st.session_state.pop(k, None)
+                    st.rerun()
+    else:
+        st.caption("_Nessun file caricato_")
+
+    new_file = st.file_uploader(
+        "Aggiungi CSV",
         type=["csv"],
-        help="Coinbase → Menu → Strumenti → Rapporti → Cronologia transazioni",
+        help="Coinbase → Menu → Strumenti → Rapporti → Cronologia transazioni. "
+             "Puoi caricare più file separati (es. un file per anno).",
+        label_visibility="collapsed",
     )
+    if new_file is not None:
+        content = new_file.read()
+        save_upload(content, new_file.name)
+        for k in ["df", "uploaded_fingerprint", "available_years"]:
+            st.session_state.pop(k, None)
+        st.rerun()
 
     st.divider()
 
-    # Anno d'imposta — popolato dagli anni disponibili nel CSV
+    # Anno d'imposta
     available_years = st.session_state.get("available_years", [TAX_YEAR])
     selected_year = st.selectbox(
         "📅 Anno d'imposta",
@@ -86,7 +121,6 @@ with st.sidebar:
         st.caption("🔑 Key caricata da `.env`")
     price_cache_key = f"market_prices_{selected_year}"
     prices_loaded = price_cache_key in st.session_state
-    n_with_prices = 0
     if prices_loaded:
         mp = st.session_state[price_cache_key]
         n_with_prices = sum(1 for v in mp.values() if v.get("end") is not None)
@@ -120,9 +154,6 @@ with st.sidebar:
 # ──────────────────────────────────────────────────────────────────────────────
 # TASSI BCE
 # ──────────────────────────────────────────────────────────────────────────────
-os.makedirs("data", exist_ok=True)
-os.makedirs("output", exist_ok=True)
-
 if fetch_btn or refresh_btn:
     with st.spinner("Download tassi BCE in corso..."):
         try:
@@ -147,7 +178,6 @@ if fetch_prices_btn and "df" in st.session_state:
         if t != "EUR" and t in TICKER_TO_ID
     ]
     progress_bar = st.sidebar.progress(0, text="Scaricamento prezzi...")
-    fetched = {}
 
     def _progress(ticker, i, total):
         progress_bar.progress((i + 1) / total, text=f"CoinGecko: {ticker} ({i+1}/{total})")
@@ -159,17 +189,38 @@ if fetch_prices_btn and "df" in st.session_state:
     st.rerun()
 
 # ──────────────────────────────────────────────────────────────────────────────
+# CARICAMENTO DATI (da data/uploads/ con cache in session_state)
+# ──────────────────────────────────────────────────────────────────────────────
+current_fp = uploads_fingerprint()
+needs_reload = st.session_state.get("uploads_fingerprint") != current_fp
+
+if needs_reload:
+    result = load_all_uploads()
+    if result is not None:
+        df, load_errors = result
+        st.session_state["df"] = df
+        st.session_state["load_errors"] = load_errors
+        st.session_state["uploads_fingerprint"] = current_fp
+        years = sorted(df["date"].apply(lambda d: d.year).unique(), reverse=True)
+        st.session_state["available_years"] = years
+    else:
+        st.session_state.pop("df", None)
+        st.session_state["uploads_fingerprint"] = current_fp
+
+# ──────────────────────────────────────────────────────────────────────────────
 # HOMEPAGE (nessun file caricato)
 # ──────────────────────────────────────────────────────────────────────────────
-if not uploaded_file:
+if "df" not in st.session_state:
     st.title("🪙 Dichiarazione Crypto – Italia")
     st.info(
         "**Come iniziare:**\n\n"
         "1. Scarica il tuo CSV da **Coinbase → Menu → Strumenti → Rapporti**.\n"
-        "2. Carica il file CSV dalla sidebar.\n"
+        "2. Carica il file CSV dalla sidebar (puoi aggiungerne più di uno).\n"
         "3. Seleziona l'**anno d'imposta** — l'app rileva automaticamente gli anni disponibili.\n"
         "4. Clicca **Scarica tassi** se il tuo CSV è in USD (non necessario per CSV europei in EUR).\n\n"
-        "Saranno calcolati automaticamente i dati per i **Quadri RT e RW** del Modello Redditi PF."
+        "Saranno calcolati automaticamente i dati per i **Quadri RT e RW** del Modello Redditi PF.\n\n"
+        "**Consiglio:** carica una volta la cronologia completa, poi aggiungi ogni anno "
+        "solo il CSV del nuovo periodo. L'app unisce i file automaticamente."
     )
     with st.expander("📖 Parametri fiscali per anno"):
         rows = []
@@ -184,25 +235,24 @@ if not uploaded_file:
         st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
     st.stop()
 
-# ──────────────────────────────────────────────────────────────────────────────
-# CARICAMENTO CSV
-# ──────────────────────────────────────────────────────────────────────────────
-fname = uploaded_file.name
-if st.session_state.get("uploaded_filename") != fname:
-    with st.spinner("Caricamento CSV..."):
-        try:
-            df = load_coinbase_csv_from_buffer(uploaded_file)
-        except Exception as e:
-            st.error(f"Errore nel caricamento CSV: {e}")
-            st.stop()
-    st.session_state["df"] = df
-    st.session_state["uploaded_filename"] = fname
-    # Rileva anni disponibili e aggiorna sidebar (forza re-render)
-    years = sorted(df["date"].apply(lambda d: d.year).unique(), reverse=True)
-    st.session_state["available_years"] = years
-    st.rerun()
-
 df = st.session_state["df"]
+
+# Warning storico incompleto
+_history_warns = check_history(df)
+for w in _history_warns:
+    st.warning(w)
+
+# Errori di caricamento file
+for e in st.session_state.get("load_errors", []):
+    st.error(f"Errore caricamento: {e}")
+
+# Info merge nella sidebar
+_summary = file_summary(df)
+if _summary and len(list_uploads()) > 1:
+    st.sidebar.caption(
+        f"**{_summary['transazioni']:,}** transazioni totali · "
+        f"{_summary['dal']} → {_summary['al']}"
+    )
 
 # ──────────────────────────────────────────────────────────────────────────────
 # CALCOLI per l'anno selezionato
@@ -395,7 +445,7 @@ with tab_ov:
                 "Costo medio unitario (€)": round(costo_medio, 4),
                 f"Qty al 31/12/{selected_year}": round(qty_attuale, 6),
                 f"Valore al 31/12/{selected_year} (€)": round(valore_attuale, 2),
-                "P&L non realizzato (€)": round(pl, 2) if pl is not None else "n/d",
+                "P&L non realizzato (€)": round(pl, 2) if pl is not None else None,
             })
 
         summary_tbl = pd.DataFrame(summary_rows).sort_values("Totale speso (€)", ascending=False)
@@ -409,13 +459,31 @@ with tab_ov:
     st.divider()
     st.subheader("💰 Totale vendite e differenza netta")
 
+    # Tutti i tipi rilevanti per calcolare la copertura per anno
+    all_tx = df[df["tx_type"].isin(["BUY", "SELL", "CONVERT", "STAKING", "EARN"])].copy()
+    all_tx["anno"] = all_tx["date"].apply(lambda d: d.year)
+
     sells_df = df[df["tx_type"].isin(["SELL", "CONVERT"])].copy()
     sells_df["anno"] = sells_df["date"].apply(lambda d: d.year)
     buys_df  = df[df["tx_type"] == "BUY"].copy()
     buys_df["anno"]  = buys_df["date"].apply(lambda d: d.year)
 
-    if sells_df.empty:
-        st.info("Nessuna vendita o conversione trovata nella cronologia.")
+    # Copertura mesi per anno (da tutte le transazioni, non solo buy/sell)
+    _MESI_IT = ["", "Gen", "Feb", "Mar", "Apr", "Mag", "Giu",
+                "Lug", "Ago", "Set", "Ott", "Nov", "Dic"]
+
+    def _periodo(group):
+        mesi = sorted(group["date"].apply(lambda d: d.month).unique())
+        n = len(mesi)
+        return f"{_MESI_IT[mesi[0]]}–{_MESI_IT[mesi[-1]]}" if n < 12 else "intero anno"
+
+    copertura = all_tx.groupby("anno").apply(_periodo).rename("Periodo")
+    n_mesi    = all_tx.groupby("anno")["date"].apply(
+        lambda s: s.apply(lambda d: d.month).nunique()
+    ).rename("Mesi")
+
+    if sells_df.empty and buys_df.empty:
+        st.info("Nessuna vendita o acquisto trovato nella cronologia.")
     else:
         ms1, ms2, ms3, ms4 = st.columns(4)
         sells_yr = sells_df[sells_df["anno"] == selected_year]["subtotal_orig"].sum()
@@ -426,49 +494,77 @@ with tab_ov:
                    delta_color="normal" if sells_yr >= buys_yr else "inverse")
         ms4.metric("N° operazioni vendita", f"{len(sells_df):,}")
 
+        # Costruisce tabella con TUTTI gli anni presenti, anche parziali
+        by_yr_buy  = buys_df.groupby("anno")["total_orig"].sum().rename("Acquistato")
+        by_yr_sell = sells_df.groupby("anno")["subtotal_orig"].sum().rename("Venduto")
+        all_anni   = sorted(all_tx["anno"].unique())  # tutti gli anni con transazioni
+
+        compare_yr = (
+            pd.DataFrame({"Anno": all_anni})
+            .set_index("Anno")
+            .join(by_yr_buy, how="left")
+            .join(by_yr_sell, how="left")
+            .fillna(0)
+            .join(copertura)
+            .join(n_mesi)
+            .reset_index()
+        )
+        compare_yr["Differenza"] = compare_yr["Venduto"] - compare_yr["Acquistato"]
+
+        # Etichetta per i grafici: aggiunge "(parz.)" agli anni incompleti
+        compare_yr["Etichetta"] = compare_yr.apply(
+            lambda r: f"{int(r['Anno'])} (parz.)" if r["Mesi"] < 12 else str(int(r["Anno"])),
+            axis=1,
+        )
+
         col_s_l, col_s_r = st.columns(2)
 
         with col_s_l:
-            # Confronto acquistato vs venduto per anno
-            by_yr_buy  = buys_df.groupby("anno")["total_orig"].sum().rename("Acquistato")
-            by_yr_sell = sells_df.groupby("anno")["subtotal_orig"].sum().rename("Venduto")
-            compare_yr = pd.concat([by_yr_buy, by_yr_sell], axis=1).fillna(0).reset_index()
-            compare_yr.columns = ["Anno", "Acquistato", "Venduto"]
-            compare_yr["Differenza"] = compare_yr["Venduto"] - compare_yr["Acquistato"]
             fig_cmp = go.Figure()
-            fig_cmp.add_trace(go.Bar(name="Acquistato", x=compare_yr["Anno"].astype(str),
-                                     y=compare_yr["Acquistato"], marker_color="#6366f1"))
-            fig_cmp.add_trace(go.Bar(name="Venduto",    x=compare_yr["Anno"].astype(str),
-                                     y=compare_yr["Venduto"],    marker_color="#22c55e"))
-            fig_cmp.update_layout(barmode="group", title="Acquistato vs Venduto per anno",
-                                  margin=dict(t=30, b=10))
+            fig_cmp.add_trace(go.Bar(
+                name="Acquistato", x=compare_yr["Etichetta"],
+                y=compare_yr["Acquistato"], marker_color="#6366f1",
+            ))
+            fig_cmp.add_trace(go.Bar(
+                name="Venduto", x=compare_yr["Etichetta"],
+                y=compare_yr["Venduto"], marker_color="#22c55e",
+            ))
+            fig_cmp.update_layout(
+                barmode="group", title="Acquistato vs Venduto per anno",
+                margin=dict(t=30, b=10),
+            )
             st.plotly_chart(fig_cmp, use_container_width=True)
 
         with col_s_r:
-            # Differenza (venduto - acquistato) per anno
-            fig_diff = px.bar(
-                compare_yr, x="Anno", y="Differenza",
-                title="Differenza netta per anno (venduto − acquistato)",
-                labels={"Differenza": "€", "Anno": ""},
-                color="Differenza",
-                color_continuous_scale=["#ef4444", "#f59e0b", "#22c55e"],
-                color_continuous_midpoint=0,
-            )
+            fig_diff = go.Figure(go.Bar(
+                x=compare_yr["Etichetta"],
+                y=compare_yr["Differenza"],
+                marker_color=[
+                    "#22c55e" if v >= 0 else "#ef4444"
+                    for v in compare_yr["Differenza"]
+                ],
+            ))
             fig_diff.add_hline(y=0, line_dash="dash", line_color="white", opacity=0.5)
-            fig_diff.update_layout(showlegend=False, margin=dict(t=30, b=10))
+            fig_diff.update_layout(
+                title="Differenza netta per anno (venduto − acquistato)",
+                margin=dict(t=30, b=10),
+            )
             st.plotly_chart(fig_diff, use_container_width=True)
 
         # Tabella per anno
         st.subheader("Riepilogo per anno")
-        compare_yr["Anno"] = compare_yr["Anno"].astype(str)
-        compare_yr["Acquistato"] = compare_yr["Acquistato"].map("€ {:,.2f}".format)
-        compare_yr["Venduto"]    = compare_yr["Venduto"].map("€ {:,.2f}".format)
-        compare_yr["Differenza"] = compare_yr["Differenza"].map("€ {:,.2f}".format)
-        st.dataframe(compare_yr, hide_index=True, use_container_width=True)
+        tbl = compare_yr[["Anno", "Periodo", "Mesi", "Acquistato", "Venduto", "Differenza"]].copy()
+        tbl["Anno"]       = tbl["Anno"].astype(int).astype(str)
+        tbl["Acquistato"] = tbl["Acquistato"].map("€ {:,.2f}".format)
+        tbl["Venduto"]    = tbl["Venduto"].map("€ {:,.2f}".format)
+        tbl["Differenza"] = tbl["Differenza"].map("€ {:,.2f}".format)
+        tbl["Mesi"]       = tbl["Mesi"].astype(int).astype(str) + "/12"
+        st.dataframe(tbl, hide_index=True, use_container_width=True)
         st.caption(
             "Acquistato = totale pagato (incluse fee). "
-            "Venduto = totale incassato al netto delle fee (subtotal). "
-            "La differenza è il P&L realizzato lordo, non equivale all'imponibile fiscale LIFO."
+            "Venduto = totale incassato al netto delle fee. "
+            "*(parz.)* = anno non ancora completo o CSV parziale. "
+            "La differenza è P&L realizzato lordo, non equivale all'imponibile fiscale LIFO."
         )
 
 # ══════════════════════════════════════════════════════════════════════════════

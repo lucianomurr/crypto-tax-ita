@@ -17,15 +17,18 @@ pytest tests/ -v       # test suite
 ## Architettura e flusso dati
 
 ```
-CSV Coinbase
-    → csv_loader.load_coinbase_csv_from_buffer()
+data/uploads/*.csv          (persistenza su disco, ignorati da git)
+    → csv_merger.load_all_uploads()
+    → merge_dataframes() + deduplicazione per ID
     → DataFrame normalizzato
     → compute_rw_data(df, rates, tax_year, market_prices)  →  rw_df
     → compute_rt_data(df, rates, tax_year)                 →  rt dict
     → generate_rw_excel(rw_df, df, tax_year)               →  BytesIO
 ```
 
-Moduli puri (nessun `st.*`, nessun side effect): `csv_loader`, `exchange_rates`, `lifo_engine`, `rw_report`, `rt_report`, `excel_report`. Tenerli così.
+**Multi-CSV**: ogni file salvato in `data/uploads/`. Al riavvio l'app li ricarica e unisce automaticamente. La deduplicazione usa la colonna `ID` (CSV europeo Coinbase); fallback su `(timestamp, asset, quantity, tx_type)`.
+
+Moduli puri (nessun `st.*`, nessun side effect): `csv_loader`, `csv_merger`, `exchange_rates`, `lifo_engine`, `rw_report`, `rt_report`, `excel_report`. Tenerli così.
 
 `app.py` è l'unico punto dove vive Streamlit. Se supera ~1000 righe, estrai i tab in `ui/tab_*.py`.
 
