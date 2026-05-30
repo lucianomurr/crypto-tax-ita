@@ -19,7 +19,7 @@ from modules.exchange_rates import get_ecb_rates, refresh_ecb_rates
 from modules.price_fetcher import (
     fetch_prices_for_rw, fetch_missing_prices,
     get_cached_prices_for_year, check_prices_completeness,
-    set_api_key, TICKER_TO_ID,
+    get_price_eur, set_api_key, TICKER_TO_ID,
 )
 from modules.csv_merger import (
     save_upload, remove_upload, list_uploads, load_all_uploads,
@@ -28,6 +28,7 @@ from modules.csv_merger import (
 from modules.rw_report import compute_rw_data
 from modules.rt_report import compute_rt_data
 from modules.excel_report import generate_rw_excel
+from modules.pdf_report import generate_compilation_pdf
 
 # ──────────────────────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -161,6 +162,24 @@ with st.sidebar:
         fetch_btn = st.button("Scarica tassi", use_container_width=True)
     with col_b:
         refresh_btn = st.button("Aggiorna", use_container_width=True, type="secondary")
+
+    st.divider()
+    st.subheader("💼 Valore attuale")
+    _cp_sb = st.session_state.get("current_prices")
+    if _cp_sb:
+        _n_ok_sb = sum(1 for v in _cp_sb.values() if v is not None)
+        _dt_sb = st.session_state.get("current_prices_date", "")
+        label_sb = f"✅ {_n_ok_sb} prezzi caricati"
+        if _dt_sb:
+            label_sb += f" ({_dt_sb})"
+        st.success(label_sb)
+    else:
+        st.caption("Prezzi non ancora caricati")
+    fetch_current_btn = st.button(
+        "🔄 Aggiorna valore attuale",
+        use_container_width=True,
+        help="Scarica i prezzi di mercato correnti da CoinGecko",
+    )
 
     st.divider()
     st.caption("⚠️ Strumento puramente informativo. Verifica con un commercialista.")
@@ -304,6 +323,32 @@ if "df" not in st.session_state:
 
 df = st.session_state["df"]
 
+# ── Quantità detenute oggi ─────────────────────────────────────────────────
+_today = pd.Timestamp.today().date()
+_BUY_TYPES_CH  = {"BUY", "RECEIVE", "STAKING", "EARN"}
+_SELL_TYPES_CH = {"SELL", "SEND", "CONVERT"}
+_current_holdings: dict = {}
+for _a in df["asset"].unique():
+    if _a == "EUR":
+        continue
+    _ad = df[df["asset"] == _a]
+    _b = _ad[_ad["tx_type"].isin(_BUY_TYPES_CH)  & (_ad["date"] <= _today)]["quantity"].sum()
+    _s = _ad[_ad["tx_type"].isin(_SELL_TYPES_CH) & (_ad["date"] <= _today)]["quantity"].sum()
+    _q = max(0.0, _b - _s)
+    if _q > 1e-8:
+        _current_holdings[_a] = round(_q, 8)
+
+# ── Fetch prezzi attuali (pulsante sidebar) ────────────────────────────────
+if fetch_current_btn:
+    _tickers_now = [t for t in _current_holdings if t in TICKER_TO_ID]
+    with st.spinner(f"Recupero {len(_tickers_now)} prezzi da CoinGecko..."):
+        _fetched_cp: dict = {}
+        for _t in _tickers_now:
+            _fetched_cp[_t] = get_price_eur(_t, _today)
+    st.session_state["current_prices"] = _fetched_cp
+    st.session_state["current_prices_date"] = _today.strftime("%d/%m/%Y")
+    st.rerun()
+
 # Warning storico incompleto
 _history_warns = check_history(df)
 for w in _history_warns:
@@ -347,6 +392,36 @@ balances = rt.get("balances", {})
 # KPI HEADER
 # ──────────────────────────────────────────────────────────────────────────────
 st.title(f"🪙 Report Fiscale Crypto – Anno {selected_year}")
+
+# ── Valore portafoglio attuale (hero metric) ──────────────────────────────
+_cp_data = st.session_state.get("current_prices", {})
+_portfolio_today = sum(
+    _current_holdings.get(t, 0) * p
+    for t, p in _cp_data.items()
+    if p is not None
+)
+_n_held     = len(_current_holdings)
+_n_valued   = sum(1 for t in _current_holdings if _cp_data.get(t) is not None)
+
+if _cp_data and _portfolio_today > 0:
+    _dt_cp = st.session_state.get("current_prices_date", "oggi")
+    pv1, pv2, pv3 = st.columns([2, 1, 1])
+    pv1.metric(
+        f"💼 Valore portafoglio ({_dt_cp})",
+        f"€ {_portfolio_today:,.2f}",
+        help="Prezzi CoinGecko × quantità detenute ad oggi",
+    )
+    pv2.metric("Asset detenuti", _n_held)
+    pv3.metric("Con prezzo", f"{_n_valued}/{_n_held}")
+else:
+    pv1, pv2 = st.columns([3, 1])
+    with pv1:
+        st.info(
+            "💼 Clicca **🔄 Aggiorna valore attuale** nella sidebar "
+            "per vedere il valore del portafoglio ad oggi."
+        )
+    pv2.metric("Asset detenuti", _n_held)
+st.divider()
 
 buys_df_all  = df[df["tx_type"] == "BUY"]
 sells_df_all = df[df["tx_type"].isin(["SELL", "CONVERT"])]
@@ -578,10 +653,31 @@ with tab_ov:
         )
         compare_yr["Differenza"] = compare_yr["Venduto"] - compare_yr["Acquistato"]
 
-        # Etichetta per i grafici: aggiunge "(parz.)" agli anni incompleti
-        compare_yr["Etichetta"] = compare_yr.apply(
-            lambda r: f"{int(r['Anno'])} (parz.)" if r["Mesi"] < 12 else str(int(r["Anno"])),
-            axis=1,
+        # Periodo e Mesi: "mesi con transazioni" ≠ "dati incompleti".
+        # Solo il primo anno (inizio attività) e l'anno corrente (in corso) sono speciali.
+        _today_date = pd.Timestamp.today().date()
+        _cur_yr   = _today_date.year
+        _first_yr = int(compare_yr["Anno"].min())
+        _first_tx = df["date"].min()  # datetime.date
+
+        def _period_label(anno_int):
+            if anno_int == _first_yr and _first_tx.month > 1:
+                return f"{_MESI_IT[_first_tx.month]}–Dic"
+            if anno_int == _cur_yr:
+                return f"Gen–{_MESI_IT[_today_date.month]} (in corso)"
+            return "intero anno"
+
+        def _mesi_count(anno_int):
+            if anno_int == _first_yr:
+                return 12 - _first_tx.month + 1
+            if anno_int == _cur_yr:
+                return _today_date.month
+            return 12
+
+        compare_yr["Periodo"]   = compare_yr["Anno"].apply(lambda a: _period_label(int(a)))
+        compare_yr["Mesi"]      = compare_yr["Anno"].apply(lambda a: _mesi_count(int(a)))
+        compare_yr["Etichetta"] = compare_yr["Anno"].apply(
+            lambda a: f"{int(a)} (in corso)" if int(a) == _cur_yr else str(int(a))
         )
 
         col_s_l, col_s_r = st.columns(2)
@@ -771,6 +867,9 @@ with tab_compila:
     st.divider()
     st.markdown(f"### Quadro {quadro_rt_label} – Plusvalenze e Minusvalenze")
 
+    # Inizializza sempre, così il download funziona anche senza vendite
+    rt_compila_df = pd.DataFrame({"Campo": [], "Valore da inserire": []})
+
     if rt_df.empty:
         st.success(
             f"Nessuna vendita nell'anno {selected_year}: "
@@ -836,7 +935,7 @@ with tab_compila:
     st.divider()
     st.markdown("### Scarica scheda compilazione")
 
-    dc1, dc2 = st.columns(2)
+    dc1, dc2, dc3 = st.columns(3)
     with dc1:
         buf_compila = io.BytesIO()
         with pd.ExcelWriter(buf_compila, engine="openpyxl") as writer:
@@ -847,7 +946,7 @@ with tab_compila:
                 rt_df.to_excel(writer, sheet_name="Dettaglio operazioni", index=False)
         buf_compila.seek(0)
         st.download_button(
-            f"⬇️ Scheda Compilazione {selected_year}",
+            f"⬇️ Scheda Compilazione {selected_year} (Excel)",
             data=buf_compila,
             file_name=f"scheda_compilazione_{quadro_label}_{selected_year}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -864,6 +963,27 @@ with tab_compila:
                 use_container_width=True,
                 type="primary",
             )
+    with dc3:
+        try:
+            _pdf_bytes = generate_compilation_pdf(
+                selected_year=selected_year,
+                is_730=is_730,
+                rw_df=rw_df,
+                rt_df=rt_df,
+                rt_summary=rt_summary,
+                params=params,
+                first_tx_date=df["date"].min(),
+            )
+            st.download_button(
+                f"⬇️ Scheda {selected_year} (PDF)",
+                data=_pdf_bytes,
+                file_name=f"dichiarazione_crypto_{selected_year}.pdf",
+                mime="application/pdf",
+                use_container_width=True,
+                type="primary",
+            )
+        except Exception as _pdf_err:
+            st.error(f"Errore generazione PDF: {_pdf_err}")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 3 – QUADRO RW
